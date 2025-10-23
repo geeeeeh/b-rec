@@ -1,4 +1,4 @@
-# Streamlit 간단 앱: 생년월일(6자리) + 연도 선택 → 판별 결과 (위치매핑 + 새 판별 로직)
+# Streamlit 간단 앱: 생년월일(6자리) + 연도 선택 → 판별 결과 (선택연도 한정 + 단일Y 규칙 정확화)
 # 실행: pip install streamlit pandas numpy
 #      streamlit run app.py
 
@@ -8,10 +8,10 @@ import numpy as np
 import streamlit as st
 
 st.set_page_config(page_title="소득세 판별", page_icon="🧾", layout="centered")
-st.title("🧾 소득세 발급/신고 판별 (간단판)")
+st.title("🧾 소득세 발급/신고 판별 (선택연도 한정 + 단일Y 규칙)")
 
 # ===== 데이터 로딩 =====
-file = st.file_uploader("CSV 데이터 업로드", type=["csv"])
+file = st.file_uploader("CSV 데이터 업로드", type=["csv"]) 
 if not file:
     st.info("샘플 파일을 업로드해 주세요. (예: 세금데이터_2015-2024.csv)")
     st.stop()
@@ -19,6 +19,7 @@ if not file:
 df = pd.read_csv(file)
 
 # 생년월일 컬럼 추정
+
 def guess_birth_col(df: pd.DataFrame) -> str:
     candidates = [c for c in df.columns if "생년월일" in c]
     if not candidates:
@@ -29,7 +30,7 @@ def guess_birth_col(df: pd.DataFrame) -> str:
 
 birth_col = guess_birth_col(df)
 
-# ===== 연도 추출 (개선: 위치 D~O 기반 + 파일명 범위 자동감지 + 시작연도 입력) =====
+# ===== 연도 추출 (위치 D~O 기반 + 파일명 범위 자동감지 + 시작연도 입력 + zip 안전 매핑) =====
 col_names = list(df.columns)
 position_cols = col_names[3:3+12]  # D~O(최대 12개)
 
@@ -58,6 +59,19 @@ selected_years = st.multiselect(
     default=years_available[-1:] if years_available else []
 )
 
+# 유틸
+
+def truthy(v):
+    s = str(v).strip().upper()
+    return s in {"1", "Y", "TRUE", "T", "예", "O", "YES", "제출"}
+
+# 선택연도 한정 판단을 위해: 컬럼→연도 역매핑
+inv_map = {v: k for k, v in year_map.items()}
+
+def in_selected(col_name: str) -> bool:
+    y = inv_map.get(col_name)
+    return (y in selected_years) if y is not None else False
+
 if st.button("판별하기", type="primary"):
     if not re.fullmatch(r"\d{6}", birth6 or ""):
         st.error("생년월일은 6자리 숫자로 입력하세요 (예: 900101)")
@@ -74,36 +88,27 @@ if st.button("판별하기", type="primary"):
 
     row = person_rows.iloc[0]
 
-    def truthy(v):
-        s = str(v).strip().upper()
-        return s in {"1", "Y", "TRUE", "T", "예", "O", "YES", "제출"}
-
-    # 선택 연도별 제출여부 수집
+    # 선택 연도별 제출여부 수집 (선택연도 한정)
     submissions = {}
     for y in selected_years:
         col = year_map.get(y)
         submissions[y] = truthy(row[col]) if (col in row) else False
 
-    # ① 모든 항목 N ?
+    # ① 모든 항목 N ? (선택연도 기준)
     all_false = not any(submissions.values())
 
-    # 선택 연도 범위 안에서만 카테고리별 Y 여부 판단
-    inv_map = {v: k for k, v in year_map.items()}
-    def in_selected(col_name: str) -> bool:
-        y = inv_map.get(col_name)
-        return (y in selected_years) if y is not None else False
-
-    is_gita = lambda name: ("기타소득" in name)          # '기타소득(간이)' 포함
+    # ② 선택연도 범위 안에서 카테고리별 Y 여부 판단
+    is_gita    = lambda name: ("기타소득" in name)       # '기타소득(간이)' 포함 포괄 매칭
     is_pension = lambda name: ("연금계좌" in name)
 
-    gita_y = any(in_selected(str(c)) and is_gita(str(c)) and truthy(row[c]) for c in row.index)
+    gita_y    = any(in_selected(str(c)) and is_gita(str(c))    and truthy(row[c]) for c in row.index)
     pension_y = any(in_selected(str(c)) and is_pension(str(c)) and truthy(row[c]) for c in row.index)
-    other_y = any(in_selected(str(c)) and (not (is_gita(str(c)) or is_pension(str(c)))) and truthy(row[c]) for c in row.index)
+    other_y   = any(in_selected(str(c)) and (not (is_gita(str(c)) or is_pension(str(c)))) and truthy(row[c]) for c in row.index)
 
-    # === 새 판별 로직 ===
-    # 모든 항목 N → '발급 가능'
-    # 타 항목 N 이면서 (기타소득만 Y 또는 연금계좌만 Y) → '지급명세서 조회 필요'
-    # 그 외 모든 경우 → '발급 불가'
+    # === 요청하신 새 판별 로직 ===
+    # 1) 모든 항목 N → '발급 가능'
+    # 2) 타 항목 N 이면서 (기타소득만 Y 또는 연금계좌만 Y) → '지급명세서 조회 필요'
+    # 3) 그 외 모든 경우 → '발급 불가'
     if all_false:
         result = "발급 가능"
     elif (gita_y and (not pension_y) and (not other_y)) or (pension_y and (not gita_y) and (not other_y)):
@@ -121,5 +126,4 @@ if st.button("판별하기", type="primary"):
         "결과": result,
     })
 
-st.caption("⚠️ 위치(D~O) 기반 매핑을 사용합니다. 파일 구조가 달라질 경우 시작연도 입력칸으로 조정하세요. "
-           "실제 세법 기준·예외는 별도로 반영해야 합니다.")
+st.caption("⚠️ 위치(D~O) 기반 매핑으로 연도를 구성하고, 선택연도 범위 내 컬럼만 판정에 사용합니다. 파일 구조가 다르면 시작연도로 조정하세요.")
