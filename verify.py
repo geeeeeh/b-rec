@@ -11,14 +11,29 @@ st.write("국립중앙도서관 JSON 파일을 업로드하면, 유사한 책을
 # 1️⃣ JSON 파일 업로드
 uploaded_file = st.file_uploader("도서정보 JSON 파일을 업로드하세요", type=["json"])
 
-if uploaded_file:
-    data = json.load(uploaded_file)
-    books = data.get("@graph", [])
+def safe_load_json(file):
+    """깨진 JSON도 최대한 안전하게 읽어오는 함수"""
+    text = file.read().decode("utf-8-sig")  # BOM 제거
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        # 여러 JSON 객체가 붙어 있는 경우 첫 번째 부분만 파싱
+        if "}\n{" in text:
+            fixed = text.split("}\n{")[0] + "}"
+            try:
+                return json.loads(fixed)
+            except Exception:
+                st.error("❌ JSON 파일 구조를 자동으로 수정했지만 여전히 문제가 있습니다.")
+                return None
+        st.error("❌ JSON 파일 형식에 오류가 있습니다. '[' 또는 ']' 누락 여부를 확인해주세요.")
+        return None
 
-    if not books:
-        st.warning("⚠️ JSON 구조에 '@graph' 항목이 없습니다.")
-    else:
-        # 2️⃣ 도서 텍스트 데이터 준비
+if uploaded_file:
+    data = safe_load_json(uploaded_file)
+    if data and "@graph" in data:
+        books = data["@graph"]
+
+        # 2️⃣ 텍스트 데이터 준비
         corpus, titles = [], []
         for book in books:
             text = " ".join([
@@ -35,7 +50,7 @@ if uploaded_file:
         selected_title = st.selectbox("추천을 원하는 책 제목을 선택하세요", titles)
 
         if st.button("추천받기"):
-            # 4️⃣ TF-IDF 유사도 계산
+            # 4️⃣ TF-IDF 벡터화 및 유사도 계산
             vectorizer = TfidfVectorizer()
             tfidf_matrix = vectorizer.fit_transform(corpus)
 
@@ -53,5 +68,7 @@ if uploaded_file:
             for i in similar_indices[1:]:
                 st.write(f"- **{titles[i]}** (유사도: {cosine_sim[i]:.3f})")
 
+    else:
+        st.warning("⚠️ '@graph' 구조를 가진 JSON 파일을 업로드해야 합니다.")
 else:
     st.info("📂 먼저 JSON 파일을 업로드하세요.")
