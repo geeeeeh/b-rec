@@ -155,7 +155,7 @@ st.sidebar.header("📂 데이터 불러오기")
 use_url = st.sidebar.checkbox("공개 URL에서 샘플 자동 로드", value=True)
 sample_url = st.sidebar.text_input(
     "샘플 JSON 공개 URL",
-    value="https://raw.githubusercontent.com/your-org/your-repo/main/nlk_books_500_ko_diverse.json",
+    value="https://raw.githubusercontent.com/geeeeeh/library-sample/main/nlk_books_500_ko_diverse.json",
     help="GitHub raw, Dropbox 'dl=1', Google Drive 'uc?export=download&id=' 등 공개로 접근 가능한 URL을 넣어주세요."
 )
 
