@@ -2,6 +2,7 @@ import streamlit as st
 import json, re, datetime, os
 from collections import Counter
 import numpy as np
+import requests
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
@@ -10,16 +11,16 @@ from sklearn.metrics.pairwise import cosine_similarity
 # =========================
 st.set_page_config(page_title="국립중앙도서관 기반 도서 추천 시스템", layout="wide")
 st.title("📚 국립중앙도서관 기반 도서 추천 시스템")
-st.caption("JSON 업로드 → 페이지/키워드 필터 → 책 선택형(검색) / 키워드형 추천 · 주제/설명/저자/출판사 가중치 + 출간일 최근 5년 가중치")
+st.caption("JSON 업로드 또는 공개 URL → 페이지/키워드 필터 → 책 선택형(검색) / 키워드형 추천 · 주제/설명/저자/출판사 가중치 + 출간일 최근 5년 가중치")
 
-# 키워드 칩 스타일 (붉은색 채움, 줄바꿈)
+# 관련 키워드 칩(결과 표시용): 연한 분홍색
 st.markdown("""
 <style>
-.keyword-row { margin-top: .25rem; }
+.keyword-row { margin: .25rem 0 .5rem 0; }
 .keyword-chip {
-  display:inline-block; padding: 4px 8px; margin: 2px 6px 2px 0;
-  background:#ef4444; color:#ffffff; border-radius:6px; font-size:0.85rem;
-  line-height:1.2; font-weight:600;
+  display:inline-block; padding: 4px 10px; margin: 3px 8px 3px 0;
+  background:#fecdd3; color:#7a1330; border-radius:8px; font-size:0.85rem;
+  line-height:1.2; font-weight:700; border:1px solid #fda4af;
 }
 </style>
 """, unsafe_allow_html=True)
@@ -27,27 +28,29 @@ st.markdown("""
 # =========================
 # 안전 로더 / 유틸
 # =========================
-def safe_load_json_file(path:str):
-    """로컬 경로에서 JSON을 안전하게 로드"""
-    with open(path, "r", encoding="utf-8-sig") as f:
-        text = f.read()
+def safe_json_from_text(text: str):
+    text = text.lstrip("\ufeff")  # BOM 제거
     try:
         return json.loads(text)
     except json.JSONDecodeError:
-        # 첫 객체만 파싱 시도
         decoder = json.JSONDecoder()
         obj, _ = decoder.raw_decode(text.lstrip())
         return obj
 
-def safe_load_json(uploaded_file):
-    """업로더에서 JSON을 안전하게 로드 (BOM/Extra data 보정)"""
-    text = uploaded_file.read().decode("utf-8-sig")
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        decoder = json.JSONDecoder()
-        obj, _ = decoder.raw_decode(text.lstrip())
-        return obj
+def safe_load_json_file(path:str):
+    with open(path, "r", encoding="utf-8-sig") as f:
+        txt = f.read()
+    return safe_json_from_text(txt)
+
+def safe_load_json_uploaded(uploaded_file):
+    txt = uploaded_file.read().decode("utf-8-sig")
+    return safe_json_from_text(txt)
+
+def safe_load_json_url(url: str, timeout=15):
+    r = requests.get(url, timeout=timeout)
+    r.raise_for_status()
+    # 일부 호스팅은 text/json 헤더 없이 내려줄 수 있으므로 text로 처리
+    return safe_json_from_text(r.text)
 
 def to_text(v):
     if v is None: return ""
@@ -62,16 +65,10 @@ def to_list(v):
     if isinstance(v, list):
         out = []
         for x in v:
-            if isinstance(x, str):
-                s = x.strip()
-                if s: out.append(s)
-            elif isinstance(x, dict):
-                for val in x.values():
-                    s = to_text(val).strip()
-                    if s: out.append(s)
-            else:
-                s = to_text(x).strip()
-                if s: out.append(s)
+            if isinstance(x, str): s = x.strip(); 
+            elif isinstance(x, dict): s = to_text(list(x.values())).strip()
+            else: s = to_text(x).strip()
+            if s: out.append(s)
         return out
     if isinstance(v, dict):
         return [to_text(x).strip() for x in v.values() if to_text(x).strip()]
@@ -88,7 +85,7 @@ def extract_year(book):
               to_text(book.get("issued")),
               to_text(book.get("datePublished")),
               to_text(book.get("publicationDate"))]:
-        m = YEAR_RE.search(c)
+        m = YEAR_RE.search(c or "")
         if m:
             try: return int(m.group(0))
             except: pass
@@ -107,10 +104,8 @@ def recency_weight(year, now_year=None):
     """최근 5년 선형 가중치 (올해=1.0 … 5년 이상=0)"""
     if year is None: return 0.0
     if now_year is None: now_year = datetime.date.today().year
-    d = now_year - year
-    d = max(d, 0)
-    if d <= 5: return (5 - d) / 5.0
-    return 0.0
+    d = max(now_year - year, 0)
+    return (5 - d) / 5.0 if d <= 5 else 0.0
 
 def pick_related_keywords(subjects, picked_keywords=None, top_n=3):
     subs = [s for s in subjects if s]
@@ -153,36 +148,47 @@ def build_records(data):
     return recs
 
 # =========================
-# 데이터 입력: 업로드 or 샘플
+# 데이터 입력: 업로드 / 공개 URL / (옵션)로컬 샘플
 # =========================
 st.sidebar.header("📂 데이터 불러오기")
-use_sample = st.sidebar.checkbox("샘플 데이터 사용 (nlk_books_500_ko_diverse.json)", value=True)
-uploaded = st.file_uploader("도서정보 JSON 업로드 (.json)", type=["json"])
+
+use_url = st.sidebar.checkbox("공개 URL에서 샘플 자동 로드", value=True)
+sample_url = st.sidebar.text_input(
+    "샘플 JSON 공개 URL",
+    value="https://raw.githubusercontent.com/your-org/your-repo/main/nlk_books_500_ko_diverse.json",
+    help="GitHub raw, Dropbox 'dl=1', Google Drive 'uc?export=download&id=' 등 공개로 접근 가능한 URL을 넣어주세요."
+)
+
+uploaded = st.file_uploader("또는 JSON 직접 업로드 (.json)", type=["json"])
 
 data = None
+
 if uploaded is not None:
     try:
-        data = safe_load_json(uploaded)
+        data = safe_load_json_uploaded(uploaded)
         st.sidebar.success("업로드된 JSON을 불러왔습니다.")
     except Exception as e:
         st.sidebar.error(f"업로드 JSON 읽기 실패: {e}")
 
-elif use_sample:
-    sample_path = "nlk_books_500_ko_diverse.json"  # 같은 폴더에 두면 자동 로드
-    if os.path.exists(sample_path):
+elif use_url and sample_url.strip():
+    try:
+        data = safe_load_json_url(sample_url.strip(), timeout=20)
+        st.sidebar.success("공개 URL에서 샘플 JSON을 불러왔습니다.")
+    except Exception as e:
+        st.sidebar.error(f"URL 로드 실패: {e}")
+
+# (선택) 같은 폴더의 로컬 샘플 파일 자동 탐지 — URL/업로드 실패 대비
+if data is None:
+    local_sample = "nlk_books_500_ko_diverse.json"
+    if os.path.exists(local_sample):
         try:
-            data = safe_load_json_file(sample_path)
-            st.sidebar.success(f"샘플 파일 로드: {sample_path}")
+            data = safe_load_json_file(local_sample)
+            st.sidebar.info(f"로컬 샘플 사용: {local_sample}")
         except Exception as e:
-            st.sidebar.error(f"샘플 JSON 읽기 실패: {e}")
-    else:
-        st.sidebar.warning("샘플 파일이 폴더에 없습니다. 먼저 같은 폴더에 배치해 주세요.")
-else:
-    st.info("좌측에서 샘플 사용을 켜거나 JSON 파일을 업로드하세요.")
-    st.stop()
+            st.sidebar.error(f"로컬 샘플 읽기 실패: {e}")
 
 if data is None:
-    st.error("유효한 JSON 데이터를 불러오지 못했습니다.")
+    st.error("유효한 JSON 데이터를 불러오지 못했습니다. URL 또는 업로드를 확인해 주세요.")
     st.stop()
 
 records = build_records(data)
@@ -283,12 +289,12 @@ with col1:
         st.session_state.matched_indices = []
 
     if st.button("검색"):
-        q = query_title.strip().lower()
+        q = (query_title or "").strip().lower()
         if not q:
             st.warning("검색어를 입력하세요.")
             st.session_state.matched_indices = []
         else:
-            matches = [i for i, t in enumerate(titles) if q in t.lower()]
+            matches = [i for i, t in enumerate(titles) if q in (t or "").lower()]
             if not matches:
                 st.info("검색 결과가 없습니다. 다른 키워드로 시도해보세요.")
             st.session_state.matched_indices = matches
@@ -344,10 +350,10 @@ with col2:
     q = st.text_input("자유 키워드 (선택)", placeholder="예: 도서관학, 저작권법, 역사")
 
     if st.button("키워드로 추천", use_container_width=True):
-        if not picked and not q.strip():
+        if not picked and not (q or "").strip():
             st.warning("키워드를 선택하거나 입력해 주세요.")
         else:
-            query = " ".join(picked + ([q.strip()] if q.strip() else []))
+            query = " ".join(picked + ([q.strip()] if (q or "").strip() else []))
             q_subj = vec_subj.transform([query])
             q_desc = vec_desc.transform([query])
             q_auth = vec_auth.transform([query])
