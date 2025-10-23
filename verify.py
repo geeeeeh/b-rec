@@ -1,52 +1,64 @@
 import streamlit as st
-import json, re, datetime
+import json, re, datetime, os
 from collections import Counter
 import numpy as np
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
 # =========================
-# 기본 세팅
+# 기본 세팅 & 스타일
 # =========================
 st.set_page_config(page_title="국립중앙도서관 기반 도서 추천 시스템", layout="wide")
 st.title("📚 국립중앙도서관 기반 도서 추천 시스템")
-st.caption("JSON 업로드 → 페이지/키워드 필터 → 책 선택형/키워드형 추천 · 주제/설명/저자/출판사 가중치 + 최근성 가중치")
+st.caption("JSON 업로드 → 페이지/키워드 필터 → 책 선택형(검색) / 키워드형 추천 · 주제/설명/저자/출판사 가중치 + 출간일 최근 5년 가중치")
+
+# 키워드 칩 스타일 (붉은색 채움, 줄바꿈)
+st.markdown("""
+<style>
+.keyword-row { margin-top: .25rem; }
+.keyword-chip {
+  display:inline-block; padding: 4px 8px; margin: 2px 6px 2px 0;
+  background:#ef4444; color:#ffffff; border-radius:6px; font-size:0.85rem;
+  line-height:1.2; font-weight:600;
+}
+</style>
+""", unsafe_allow_html=True)
 
 # =========================
 # 안전 로더 / 유틸
 # =========================
-def safe_load_json(file):
-    """UTF-8 BOM 제거 + 여러 JSON이 붙은 경우 첫 객체만 파싱"""
-    text = file.read().decode("utf-8-sig")
+def safe_load_json_file(path:str):
+    """로컬 경로에서 JSON을 안전하게 로드"""
+    with open(path, "r", encoding="utf-8-sig") as f:
+        text = f.read()
     try:
         return json.loads(text)
     except json.JSONDecodeError:
-        try:
-            decoder = json.JSONDecoder()
-            obj, _ = decoder.raw_decode(text.lstrip())
-            return obj
-        except Exception as e:
-            st.error(f"❌ JSON 파일 형식 오류: {e}")
-            return None
+        # 첫 객체만 파싱 시도
+        decoder = json.JSONDecoder()
+        obj, _ = decoder.raw_decode(text.lstrip())
+        return obj
+
+def safe_load_json(uploaded_file):
+    """업로더에서 JSON을 안전하게 로드 (BOM/Extra data 보정)"""
+    text = uploaded_file.read().decode("utf-8-sig")
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        decoder = json.JSONDecoder()
+        obj, _ = decoder.raw_decode(text.lstrip())
+        return obj
 
 def to_text(v):
-    """값을 안전하게 문자열로 변환"""
-    if v is None:
-        return ""
-    if isinstance(v, str):
-        return v
-    if isinstance(v, (int, float, bool)):
-        return str(v)
-    if isinstance(v, list):
-        return " ".join(to_text(x) for x in v)
-    if isinstance(v, dict):
-        return " ".join(to_text(x) for x in v.values())
+    if v is None: return ""
+    if isinstance(v, str): return v
+    if isinstance(v, (int, float, bool)): return str(v)
+    if isinstance(v, list): return " ".join(to_text(x) for x in v)
+    if isinstance(v, dict): return " ".join(to_text(x) for x in v.values())
     return str(v)
 
 def to_list(v):
-    """subject 같은 필드를 리스트[str]로 변환"""
-    if v is None:
-        return []
+    if v is None: return []
     if isinstance(v, list):
         out = []
         for x in v:
@@ -72,7 +84,6 @@ YEAR_RE = re.compile(r"(19|20)\d{2}")
 PAGES_RE = re.compile(r"(\d+)\s*p\b", re.IGNORECASE)
 
 def extract_year(book):
-    """issuedYear/issued/datePublished 등에서 4자리 연도 추출"""
     for c in [to_text(book.get("issuedYear")),
               to_text(book.get("issued")),
               to_text(book.get("datePublished")),
@@ -84,7 +95,6 @@ def extract_year(book):
     return None
 
 def extract_pages(book):
-    """extent에서 '숫자+p' 추출 → 최대값을 페이지 수로 사용"""
     ext = to_list(book.get("extent"))
     found = []
     for token in ext:
@@ -102,16 +112,12 @@ def recency_weight(year, now_year=None):
     if d <= 5: return (5 - d) / 5.0
     return 0.0
 
-# 추천 결과에 붙일 관련 키워드 2~3개 선정
 def pick_related_keywords(subjects, picked_keywords=None, top_n=3):
     subs = [s for s in subjects if s]
-    if not subs:
-        return []
+    if not subs: return []
     picked_set = set([k.strip() for k in (picked_keywords or []) if k.strip()])
-    # 1순위: 사용자가 선택한 키워드와의 교집합
     inter = [s for s in subs if s in picked_set]
     result = inter[:top_n]
-    # 부족하면 subject에서 앞쪽 키워드로 채우기
     if len(result) < top_n:
         for s in subs:
             if s not in result:
@@ -120,23 +126,15 @@ def pick_related_keywords(subjects, picked_keywords=None, top_n=3):
                 break
     return result[:top_n]
 
+def render_keywords_row(keywords):
+    if not keywords: return ""
+    chips = "".join(f'<span class="keyword-chip">{kw}</span>' for kw in keywords)
+    return f'<div class="keyword-row">{chips}</div>'
+
 # =========================
 # 데이터 변환
 # =========================
 def build_records(data):
-    """
-    각 도서 레코드:
-    {
-      'title': str,
-      'subjects': List[str],
-      'desc': str,
-      'creator': str,
-      'publisher': str,
-      'year': int|None,
-      'pages': int|None,
-      'raw': dict
-    }
-    """
     if not isinstance(data, dict): return []
     books = data.get("@graph", [])
     if not isinstance(books, list) or not books: return []
@@ -155,15 +153,36 @@ def build_records(data):
     return recs
 
 # =========================
-# 업로드
+# 데이터 입력: 업로드 or 샘플
 # =========================
-uploaded = st.file_uploader("도서정보 JSON 파일 업로드", type=["json"])
-if not uploaded:
-    st.info("📂 먼저 JSON 파일을 업로드하세요.")
+st.sidebar.header("📂 데이터 불러오기")
+use_sample = st.sidebar.checkbox("샘플 데이터 사용 (nlk_books_500_ko_diverse.json)", value=True)
+uploaded = st.file_uploader("도서정보 JSON 업로드 (.json)", type=["json"])
+
+data = None
+if uploaded is not None:
+    try:
+        data = safe_load_json(uploaded)
+        st.sidebar.success("업로드된 JSON을 불러왔습니다.")
+    except Exception as e:
+        st.sidebar.error(f"업로드 JSON 읽기 실패: {e}")
+
+elif use_sample:
+    sample_path = "nlk_books_500_ko_diverse.json"  # 같은 폴더에 두면 자동 로드
+    if os.path.exists(sample_path):
+        try:
+            data = safe_load_json_file(sample_path)
+            st.sidebar.success(f"샘플 파일 로드: {sample_path}")
+        except Exception as e:
+            st.sidebar.error(f"샘플 JSON 읽기 실패: {e}")
+    else:
+        st.sidebar.warning("샘플 파일이 폴더에 없습니다. 먼저 같은 폴더에 배치해 주세요.")
+else:
+    st.info("좌측에서 샘플 사용을 켜거나 JSON 파일을 업로드하세요.")
     st.stop()
 
-data = safe_load_json(uploaded)
 if data is None:
+    st.error("유효한 JSON 데이터를 불러오지 못했습니다.")
     st.stop()
 
 records = build_records(data)
@@ -183,8 +202,7 @@ page_range = st.sidebar.slider("페이지(쪽) 범위", min_value=min_pages, max
                                value=(min_pages, max_pages))
 
 def pass_page_filter(p):
-    if p is None:
-        return include_no_pages
+    if p is None: return include_no_pages
     return page_range[0] <= p <= page_range[1]
 
 filtered = [r for r in records if pass_page_filter(r["pages"])]
@@ -196,13 +214,11 @@ if not filtered:
 # 상위 10 키워드
 # =========================
 all_subjects = []
-for r in filtered:
-    all_subjects.extend(r["subjects"])
+for r in filtered: all_subjects.extend(r["subjects"])
 top_keywords = [kw for kw, _ in Counter([s for s in all_subjects if s]).most_common(10)]
 
 # =========================
-# 필드별 말뭉치 구축 (제목/KDC 제거됨)
-# 남는 가중치 대상: subject, description, author, publisher
+# 말뭉치(제목/KDC 제외)
 # =========================
 titles = [r["title"] for r in filtered]
 subject_texts = [" ".join(r["subjects"]) for r in filtered]
@@ -212,9 +228,8 @@ publisher_texts = [r["publisher"] for r in filtered]
 years = [r["year"] for r in filtered]
 pages = [r["pages"] for r in filtered]
 raw_books = [r["raw"] for r in filtered]
-subjects_by_idx = [r["subjects"] for r in filtered]  # 결과 키워드 표시에 사용
+subjects_by_idx = [r["subjects"] for r in filtered]
 
-# 벡터라이저(필드별)
 vec_subj = TfidfVectorizer()
 vec_desc = TfidfVectorizer()
 vec_auth = TfidfVectorizer()
@@ -229,7 +244,7 @@ now_year = datetime.date.today().year
 recency_vec = np.array([recency_weight(y, now_year) for y in years], dtype=float)
 
 # =========================
-# 가중치 UI (제목/KDC 제거)
+# 가중치 UI
 # =========================
 st.sidebar.markdown("### ⚖️ 세부 가중치 (콘텐츠)")
 w_subj = st.sidebar.slider("주제(키워드) 가중치", 0.0, 1.0, 0.45, 0.05)
@@ -243,8 +258,8 @@ if w_sum == 0:
     w_sum = 1.0
 w_subj, w_desc, w_auth, w_pub = [w / w_sum for w in [w_subj, w_desc, w_auth, w_pub]]
 
-st.sidebar.markdown("### ⏱ 최근성 가중치")
-w_recency = st.sidebar.slider("최근 5년 가중치 비율", 0.0, 0.8, 0.30, 0.05,
+st.sidebar.markdown("### ⏱ 출간일 최근 5년 가중치")
+w_recency = st.sidebar.slider("출간일 최근 5년 가중치", 0.0, 0.8, 0.30, 0.05,
                               help="최종 점수 = (1-비율)*콘텐츠점수 + (비율)*최근성")
 top_n = st.sidebar.slider("추천 개수 (Top N)", 3, 15, 5)
 
@@ -259,37 +274,67 @@ def final_score(content_sim, rec_vec):
 # =========================
 col1, col2 = st.columns(2, vertical_alignment="top")
 
-# ---------- A) 책 선택형 ----------
+# ---------- A) 책 선택형 (검색) ----------
 with col1:
-    st.subheader("🔖 책 선택형 추천")
-    sel_title = st.selectbox("추천 기준이 될 책을 선택하세요", options=titles, index=0)
-    if st.button("이 책과 비슷한 도서 추천", use_container_width=True):
-        idx = titles.index(sel_title)
-        s_subj = cosine_similarity(X_subj[idx], X_subj).flatten()
-        s_desc = cosine_similarity(X_desc[idx], X_desc).flatten()
-        s_auth = cosine_similarity(X_auth[idx], X_auth).flatten()
-        s_pub  = cosine_similarity(X_pub[idx],  X_pub ).flatten()
+    st.subheader("🔖 책 선택형 추천 (검색)")
+    query_title = st.text_input("제목 검색어를 입력하세요 (부분일치 지원)", placeholder="예: 도서관학, 저작권, 디지털도서관")
 
-        content_sim = combine_content_score(s_subj, s_desc, s_auth, s_pub)
-        final = final_score(content_sim, recency_vec)
+    if "matched_indices" not in st.session_state:
+        st.session_state.matched_indices = []
 
-        order = final.argsort()[::-1]
-        recs = [i for i in order if i != idx][:top_n]
-
-        st.write(f"**기준 도서:** {sel_title}")
-        if not recs:
-            st.info("추천 결과가 없습니다.")
+    if st.button("검색"):
+        q = query_title.strip().lower()
+        if not q:
+            st.warning("검색어를 입력하세요.")
+            st.session_state.matched_indices = []
         else:
-            for i in recs:
-                creator = to_text(raw_books[i].get("creator")) or "저자 정보 없음"
-                y = years[i] or "N/A"
-                p = pages[i] if pages[i] is not None else "N/A"
-                rel_keywords = pick_related_keywords(subjects_by_idx[i], picked_keywords=None, top_n=3)
-                kw_disp = " · 관련 키워드: " + ", ".join(rel_keywords) if rel_keywords else ""
-                st.markdown(
-                    f"- **{titles[i]}** — {creator} (연도: {y}, 쪽수: {p})  "
-                    f"· 콘텐츠점수: {content_sim[i]:.3f} · 최종점수: {final[i]:.3f}{kw_disp}"
-                )
+            matches = [i for i, t in enumerate(titles) if q in t.lower()]
+            if not matches:
+                st.info("검색 결과가 없습니다. 다른 키워드로 시도해보세요.")
+            st.session_state.matched_indices = matches
+
+    if st.session_state.matched_indices:
+        options = [titles[i] for i in st.session_state.matched_indices]
+        sel_title = st.selectbox("검색 결과에서 기준 도서를 선택하세요", options=options, index=0, key="select_matched_title")
+
+        if st.button("이 책과 비슷한 도서 추천", use_container_width=True):
+            target_title = st.session_state.select_matched_title
+            idx = None
+            for i in st.session_state.matched_indices:
+                if titles[i] == target_title:
+                    idx = i; break
+            if idx is None:
+                st.error("선택한 책을 찾을 수 없습니다.")
+            else:
+                s_subj = cosine_similarity(X_subj[idx], X_subj).flatten()
+                s_desc = cosine_similarity(X_desc[idx], X_desc).flatten()
+                s_auth = cosine_similarity(X_auth[idx], X_auth).flatten()
+                s_pub  = cosine_similarity(X_pub[idx],  X_pub ).flatten()
+
+                content_sim = combine_content_score(s_subj, s_desc, s_auth, s_pub)
+                final = final_score(content_sim, recency_vec)
+
+                order = final.argsort()[::-1]
+                recs = [i for i in order if i != idx][:top_n]
+
+                st.write(f"**기준 도서:** {target_title}")
+                if not recs:
+                    st.info("추천 결과가 없습니다.")
+                else:
+                    for i in recs:
+                        creator = to_text(raw_books[i].get("creator")) or "저자 정보 없음"
+                        y = years[i] or "N/A"
+                        p = pages[i] if pages[i] is not None else "N/A"
+                        rel_keywords = pick_related_keywords(subjects_by_idx[i], picked_keywords=None, top_n=3)
+                        kw_html = render_keywords_row(rel_keywords)
+                        st.markdown(
+                            f"- **{titles[i]}** — {creator} (연도: {y}, 쪽수: {p})  "
+                            f"· 콘텐츠점수: {content_sim[i]:.3f} · 최종점수: {final[i]:.3f}",
+                            unsafe_allow_html=True
+                        )
+                        st.markdown(kw_html, unsafe_allow_html=True)
+    else:
+        st.caption("검색 후 결과 목록에서 기준 도서를 선택하세요.")
 
 # ---------- B) 키워드 검색형 ----------
 with col2:
@@ -323,8 +368,10 @@ with col2:
                 y = years[i] or "N/A"
                 p = pages[i] if pages[i] is not None else "N/A"
                 rel_keywords = pick_related_keywords(subjects_by_idx[i], picked_keywords=picked, top_n=3)
-                kw_disp = " · 관련 키워드: " + ", ".join(rel_keywords) if rel_keywords else ""
+                kw_html = render_keywords_row(rel_keywords)
                 st.markdown(
                     f"- **{titles[i]}** — {creator} (연도: {y}, 쪽수: {p})  "
-                    f"· 콘텐츠점수: {content_sim[i]:.3f} · 최종점수: {final[i]:.3f}{kw_disp}"
+                    f"· 콘텐츠점수: {content_sim[i]:.3f} · 최종점수: {final[i]:.3f}",
+                    unsafe_allow_html=True
                 )
+                st.markdown(kw_html, unsafe_allow_html=True)
