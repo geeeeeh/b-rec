@@ -10,7 +10,7 @@ from sklearn.metrics.pairwise import cosine_similarity
 # =========================
 st.set_page_config(page_title="국립중앙도서관 기반 도서 추천 시스템", layout="wide")
 st.title("📚 국립중앙도서관 기반 도서 추천 시스템")
-st.caption("JSON 업로드 → 페이지/키워드 필터 → 책 선택형/키워드형 추천 · 주제/설명/저자/출판사 가중치 + 최근성 가중치")
+st.caption("JSON 업로드 → 페이지/키워드 필터 → 책 선택형(검색) / 키워드형 추천 · 주제/설명/저자/출판사 가중치 + 출간일 최근 5년 가중치")
 
 # =========================
 # 안전 로더 / 유틸
@@ -201,8 +201,7 @@ for r in filtered:
 top_keywords = [kw for kw, _ in Counter([s for s in all_subjects if s]).most_common(10)]
 
 # =========================
-# 필드별 말뭉치 구축 (제목/KDC 제거됨)
-# 남는 가중치 대상: subject, description, author, publisher
+# 필드별 말뭉치 (제목/KDC 제외)
 # =========================
 titles = [r["title"] for r in filtered]
 subject_texts = [" ".join(r["subjects"]) for r in filtered]
@@ -212,7 +211,7 @@ publisher_texts = [r["publisher"] for r in filtered]
 years = [r["year"] for r in filtered]
 pages = [r["pages"] for r in filtered]
 raw_books = [r["raw"] for r in filtered]
-subjects_by_idx = [r["subjects"] for r in filtered]  # 결과 키워드 표시에 사용
+subjects_by_idx = [r["subjects"] for r in filtered]
 
 # 벡터라이저(필드별)
 vec_subj = TfidfVectorizer()
@@ -243,8 +242,8 @@ if w_sum == 0:
     w_sum = 1.0
 w_subj, w_desc, w_auth, w_pub = [w / w_sum for w in [w_subj, w_desc, w_auth, w_pub]]
 
-st.sidebar.markdown("### ⏱ 최근성 가중치")
-w_recency = st.sidebar.slider("최근 5년 가중치 비율", 0.0, 0.8, 0.30, 0.05,
+st.sidebar.markdown("### ⏱ 출간일 최근 5년 가중치")
+w_recency = st.sidebar.slider("출간일 최근 5년 가중치", 0.0, 0.8, 0.30, 0.05,
                               help="최종 점수 = (1-비율)*콘텐츠점수 + (비율)*최근성")
 top_n = st.sidebar.slider("추천 개수 (Top N)", 3, 15, 5)
 
@@ -259,37 +258,70 @@ def final_score(content_sim, rec_vec):
 # =========================
 col1, col2 = st.columns(2, vertical_alignment="top")
 
-# ---------- A) 책 선택형 ----------
+# ---------- A) 책 선택형 (검색 기반) ----------
 with col1:
-    st.subheader("🔖 책 선택형 추천")
-    sel_title = st.selectbox("추천 기준이 될 책을 선택하세요", options=titles, index=0)
-    if st.button("이 책과 비슷한 도서 추천", use_container_width=True):
-        idx = titles.index(sel_title)
-        s_subj = cosine_similarity(X_subj[idx], X_subj).flatten()
-        s_desc = cosine_similarity(X_desc[idx], X_desc).flatten()
-        s_auth = cosine_similarity(X_auth[idx], X_auth).flatten()
-        s_pub  = cosine_similarity(X_pub[idx],  X_pub ).flatten()
+    st.subheader("🔖 책 선택형 추천 (검색)")
+    # 검색어 입력
+    query_title = st.text_input("제목 검색어를 입력하세요 (부분일치 지원)", placeholder="예: 도서관학, 저작권, 디지털도서관")
+    # 검색 실행 버튼
+    if "matched_indices" not in st.session_state:
+        st.session_state.matched_indices = []
 
-        content_sim = combine_content_score(s_subj, s_desc, s_auth, s_pub)
-        final = final_score(content_sim, recency_vec)
-
-        order = final.argsort()[::-1]
-        recs = [i for i in order if i != idx][:top_n]
-
-        st.write(f"**기준 도서:** {sel_title}")
-        if not recs:
-            st.info("추천 결과가 없습니다.")
+    if st.button("검색"):
+        q = query_title.strip().lower()
+        if not q:
+            st.warning("검색어를 입력하세요.")
+            st.session_state.matched_indices = []
         else:
-            for i in recs:
-                creator = to_text(raw_books[i].get("creator")) or "저자 정보 없음"
-                y = years[i] or "N/A"
-                p = pages[i] if pages[i] is not None else "N/A"
-                rel_keywords = pick_related_keywords(subjects_by_idx[i], picked_keywords=None, top_n=3)
-                kw_disp = " · 관련 키워드: " + ", ".join(rel_keywords) if rel_keywords else ""
-                st.markdown(
-                    f"- **{titles[i]}** — {creator} (연도: {y}, 쪽수: {p})  "
-                    f"· 콘텐츠점수: {content_sim[i]:.3f} · 최종점수: {final[i]:.3f}{kw_disp}"
-                )
+            matches = [i for i, t in enumerate(titles) if q in t.lower()]
+            if not matches:
+                st.info("검색 결과가 없습니다. 다른 키워드로 시도해보세요.")
+            st.session_state.matched_indices = matches
+
+    # 검색 결과 목록에서 선택
+    if st.session_state.matched_indices:
+        options = [titles[i] for i in st.session_state.matched_indices]
+        sel_title = st.selectbox("검색 결과에서 기준 도서를 선택하세요", options=options, index=0, key="select_matched_title")
+
+        if st.button("이 책과 비슷한 도서 추천", use_container_width=True):
+            # 선택 제목의 전역 인덱스 찾기
+            target_title = st.session_state.select_matched_title
+            # 전역 인덱스 (filtered 내)
+            idx = None
+            for i in st.session_state.matched_indices:
+                if titles[i] == target_title:
+                    idx = i
+                    break
+            if idx is None:
+                st.error("선택한 책을 찾을 수 없습니다.")
+            else:
+                s_subj = cosine_similarity(X_subj[idx], X_subj).flatten()
+                s_desc = cosine_similarity(X_desc[idx], X_desc).flatten()
+                s_auth = cosine_similarity(X_auth[idx], X_auth).flatten()
+                s_pub  = cosine_similarity(X_pub[idx],  X_pub ).flatten()
+
+                content_sim = combine_content_score(s_subj, s_desc, s_auth, s_pub)
+                final = final_score(content_sim, recency_vec)
+
+                order = final.argsort()[::-1]
+                recs = [i for i in order if i != idx][:top_n]
+
+                st.write(f"**기준 도서:** {target_title}")
+                if not recs:
+                    st.info("추천 결과가 없습니다.")
+                else:
+                    for i in recs:
+                        creator = to_text(raw_books[i].get("creator")) or "저자 정보 없음"
+                        y = years[i] or "N/A"
+                        p = pages[i] if pages[i] is not None else "N/A"
+                        rel_keywords = pick_related_keywords(subjects_by_idx[i], picked_keywords=None, top_n=3)
+                        kw_disp = " · 관련 키워드: " + ", ".join(rel_keywords) if rel_keywords else ""
+                        st.markdown(
+                            f"- **{titles[i]}** — {creator} (연도: {y}, 쪽수: {p})  "
+                            f"· 콘텐츠점수: {content_sim[i]:.3f} · 최종점수: {final[i]:.3f}{kw_disp}"
+                        )
+    else:
+        st.caption("검색 후 결과 목록에서 기준 도서를 선택하세요.")
 
 # ---------- B) 키워드 검색형 ----------
 with col2:
