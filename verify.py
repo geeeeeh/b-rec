@@ -10,7 +10,7 @@ from sklearn.metrics.pairwise import cosine_similarity
 # =========================
 st.set_page_config(page_title="국립중앙도서관 기반 도서 추천 시스템", layout="wide")
 st.title("📚 국립중앙도서관 기반 도서 추천 시스템")
-st.caption("JSON 업로드 → 페이지/키워드 필터 → 책 선택형 / 키워드형 추천 · 주제/설명/저자/출판사 가중치 + 출간일 최근 5년 가중치")
+st.caption("JSON 업로드 → 페이지/키워드 필터 → 책 검색형 / 키워드형 추천 · 주제/설명/저자/출판사 가중치 + 출간일 최근 5년 가중치")
 
 # =========================
 # 안전 로더 / 유틸
@@ -260,7 +260,7 @@ col1, col2 = st.columns(2, vertical_alignment="top")
 
 # ---------- A) 책 선택형 (검색 기반) ----------
 with col1:
-    st.subheader("🔖 책 선택형 추천 (검색)")
+    st.subheader("🔖 책 검색형 추천 ")
     # 검색어 입력
     query_title = st.text_input("제목 검색어를 입력하세요 (부분일치 지원)", placeholder="예: 도서관학, 저작권, 디지털도서관")
     # 검색 실행 버튼
